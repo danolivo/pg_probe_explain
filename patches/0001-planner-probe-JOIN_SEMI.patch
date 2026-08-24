@@ -1,0 +1,87 @@
+From: Andrei Lepikhov <andrei.lepikhov@pgedge.com>
+Subject: [PATCH] Demo planner probe: raise a flag when a JOIN_SEMI path is built
+
+Debugging-only core patch for contrib/pg_probe_explain.  It exports a single
+boolean, planner_probe_hit, and raises it whenever the planner successfully
+builds a nestloop, mergejoin or hashjoin path whose jointype is JOIN_SEMI.
+The flag is never cleared by the core: the module that reads it clears it
+before planning each statement.
+
+To ask a different question - "an unparameterised path over a partitioned
+table was built", "a selectivity estimate was clamped", "extended statistics
+were used" - move the two-line probe to wherever that happens and leave the
+module alone.
+
+Applies to REL_18_STABLE.
+---
+diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+index e8d8a537061..838ce4724f7 100644
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -42,6 +42,13 @@ typedef enum
+ 	COSTS_DIFFERENT,			/* neither path dominates the other on cost */
+ } PathCostComparison;
+ 
++/*
++ * Probe flag reported to loadable modules.  Here it is raised whenever the
++ * planner builds a join path implementing a semi-join; see the comment in
++ * pathnode.h.
++ */
++bool		planner_probe_hit = false;
++
+ /*
+  * STD_FUZZ_FACTOR is the normal fuzz factor for compare_path_costs_fuzzily.
+  * XXX is it worth making this user-controllable?  It provides a tradeoff
+@@ -2683,6 +2690,10 @@ create_nestloop_path(PlannerInfo *root,
+ 	Relids		inner_req_outer = PATH_REQ_OUTER(inner_path);
+ 	Relids		outerrelids;
+ 
++	/* Report to interested modules that a semi-join path was built. */
++	if (jointype == JOIN_SEMI)
++		planner_probe_hit = true;
++
+ 	/*
+ 	 * Paths are parameterized by top-level parents, so run parameterization
+ 	 * tests on the parent relids.
+@@ -2782,6 +2793,10 @@ create_mergejoin_path(PlannerInfo *root,
+ {
+ 	MergePath  *pathnode = makeNode(MergePath);
+ 
++	/* Report to interested modules that a semi-join path was built. */
++	if (jointype == JOIN_SEMI)
++		planner_probe_hit = true;
++
+ 	pathnode->jpath.path.pathtype = T_MergeJoin;
+ 	pathnode->jpath.path.parent = joinrel;
+ 	pathnode->jpath.path.pathtarget = joinrel->reltarget;
+@@ -2847,6 +2862,10 @@ create_hashjoin_path(PlannerInfo *root,
+ {
+ 	HashPath   *pathnode = makeNode(HashPath);
+ 
++	/* Report to interested modules that a semi-join path was built. */
++	if (jointype == JOIN_SEMI)
++		planner_probe_hit = true;
++
+ 	pathnode->jpath.path.pathtype = T_HashJoin;
+ 	pathnode->jpath.path.parent = joinrel;
+ 	pathnode->jpath.path.pathtarget = joinrel->reltarget;
+diff --git a/src/include/optimizer/pathnode.h b/src/include/optimizer/pathnode.h
+index 60dcdb77e41..1e5ffb97206 100644
+--- a/src/include/optimizer/pathnode.h
++++ b/src/include/optimizer/pathnode.h
+@@ -17,6 +17,15 @@
+ #include "nodes/bitmapset.h"
+ #include "nodes/pathnodes.h"
+ 
++/*
++ * Debugging aid: a probe flag that the planner sets when a condition of
++ * interest is met while building paths, so that a loadable module can notice
++ * it once planning is over.  The core only ever sets the flag; clearing it
++ * before planning is the reader's responsibility.  See
++ * contrib/pg_probe_explain.
++ */
++extern PGDLLIMPORT bool planner_probe_hit;
++
+ 
+ /*
+  * prototypes for pathnode.c

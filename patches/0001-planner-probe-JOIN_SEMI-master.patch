@@ -1,0 +1,73 @@
+From: Andrei Lepikhov <andrei.lepikhov@pgedge.com>
+Subject: [PATCH] Demo planner probe: raise a flag when a JOIN_SEMI path is built
+
+Same as 0001, rebased onto master (20devel).  See
+contrib/pg_probe_explain/README.md.
+---
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -40,6 +40,13 @@
+ } PathCostComparison;
+ 
+ /*
++ * Probe flag reported to loadable modules.  Here it is raised whenever the
++ * planner builds a join path implementing a semi-join; see the comment in
++ * pathnode.h.
++ */
++bool		planner_probe_hit = false;
++
++/*
+  * STD_FUZZ_FACTOR is the normal fuzz factor for compare_path_costs_fuzzily.
+  * XXX is it worth making this user-controllable?  It provides a tradeoff
+  * between planner runtime and the accuracy of path cost comparisons.
+@@ -2369,6 +2376,10 @@
+ 	Relids		inner_req_outer = PATH_REQ_OUTER(inner_path);
+ 	Relids		outerrelids;
+ 
++	/* Report to interested modules that a semi-join path was built. */
++	if (jointype == JOIN_SEMI)
++		planner_probe_hit = true;
++
+ 	/*
+ 	 * Paths are parameterized by top-level parents, so run parameterization
+ 	 * tests on the parent relids.
+@@ -2468,6 +2479,10 @@
+ {
+ 	MergePath  *pathnode = makeNode(MergePath);
+ 
++	/* Report to interested modules that a semi-join path was built. */
++	if (jointype == JOIN_SEMI)
++		planner_probe_hit = true;
++
+ 	pathnode->jpath.path.pathtype = T_MergeJoin;
+ 	pathnode->jpath.path.parent = joinrel;
+ 	pathnode->jpath.path.pathtarget = joinrel->reltarget;
+@@ -2533,6 +2548,10 @@
+ {
+ 	HashPath   *pathnode = makeNode(HashPath);
+ 
++	/* Report to interested modules that a semi-join path was built. */
++	if (jointype == JOIN_SEMI)
++		planner_probe_hit = true;
++
+ 	pathnode->jpath.path.pathtype = T_HashJoin;
+ 	pathnode->jpath.path.parent = joinrel;
+ 	pathnode->jpath.path.pathtarget = joinrel->reltarget;
+--- a/src/include/optimizer/pathnode.h
++++ b/src/include/optimizer/pathnode.h
+@@ -17,6 +17,15 @@
+ #include "nodes/bitmapset.h"
+ #include "nodes/pathnodes.h"
+ 
++/*
++ * Debugging aid: a probe flag that the planner sets when a condition of
++ * interest is met while building paths, so that a loadable module can notice
++ * it once planning is over.  The core only ever sets the flag; clearing it
++ * before planning is the reader's responsibility.  See
++ * contrib/pg_probe_explain.
++ */
++extern PGDLLIMPORT bool planner_probe_hit;
++
+ /* Hook for plugins to get control in build_simple_rel() */
+ typedef void (*build_simple_rel_hook_type) (PlannerInfo *root,
+ 											RelOptInfo *rel,
