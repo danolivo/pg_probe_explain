@@ -1,0 +1,71 @@
+From: Andrei Lepikhov <andrei.lepikhov@pgedge.com>
+Subject: [PATCH] Demo planner probe: raise a flag when a parameterized nestloop is built
+
+Debugging-only core patch for contrib/pg_probe_explain, an alternative to
+0001-planner-probe-JOIN_SEMI.patch - both export the same boolean, so apply one
+or the other, not both.
+
+It raises planner_probe_hit in create_nestloop_path() whenever the inner path
+draws its parameters from the outer relation, i.e. whenever a parameterized
+nestloop path is built.  The flag goes up regardless of what the cost comparison
+later decides, so a query is logged even when the final plan contains no
+nestloop at all - which is exactly the case EXPLAIN cannot show you.
+
+Note what is *not* being tested here.  A nestloop path can also be
+parameterized from above, meaning the join as a whole needs parameters from some
+outer relation; that condition is `required_outer` being non-empty, and swapping
+the test is a one-line change if that is the question you want to ask.
+
+Applies to REL_18_STABLE and, with offsets, to 1C_18_1.
+---
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -43,6 +43,12 @@
+ } PathCostComparison;
+ 
+ /*
++ * Probe flag reported to loadable modules.  Here it is raised whenever the
++ * planner builds a parameterized nestloop path; see the comment in pathnode.h.
++ */
++bool		planner_probe_hit = false;
++
++/*
+  * STD_FUZZ_FACTOR is the normal fuzz factor for compare_path_costs_fuzzily.
+  * XXX is it worth making this user-controllable?  It provides a tradeoff
+  * between planner runtime and the accuracy of path cost comparisons.
+@@ -2693,6 +2699,17 @@
+ 		outerrelids = outer_path->parent->relids;
+ 
+ 	/*
++	 * Report to interested modules that a parameterized nestloop was built:
++	 * the inner path draws its parameters from the outer relation, so the
++	 * executor can drive the inner side one outer row at a time.  Whether the
++	 * path then wins on cost is a different question, and deliberately not
++	 * asked here - catching the paths that were built and lost is the whole
++	 * point of the probe.
++	 */
++	if (bms_overlap(inner_req_outer, outerrelids))
++		planner_probe_hit = true;
++
++	/*
+ 	 * If the inner path is parameterized by the outer, we must drop any
+ 	 * restrict_clauses that are due to be moved into the inner path.  We have
+ 	 * to do this now, rather than postpone the work till createplan time,
+--- a/src/include/optimizer/pathnode.h
++++ b/src/include/optimizer/pathnode.h
+@@ -17,6 +17,15 @@
+ #include "nodes/bitmapset.h"
+ #include "nodes/pathnodes.h"
+ 
++/*
++ * Debugging aid: a probe flag that the planner sets when a condition of
++ * interest is met while building paths, so that a loadable module can notice
++ * it once planning is over.  The core only ever sets the flag; clearing it
++ * before planning is the reader's responsibility.  See
++ * contrib/pg_probe_explain.
++ */
++extern PGDLLIMPORT bool planner_probe_hit;
++
+ 
+ /*
+  * prototypes for pathnode.c

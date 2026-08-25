@@ -52,6 +52,25 @@ sub run_and_capture_log
 
 my $marker = qr/pg_probe_explain: planner probe hit/;
 
+# Which probe is this server carrying?  The demo patches export the same flag,
+# so only one can be applied at a time.  A semi join between two tables with no
+# indexes at all can produce no parameterized path either, so it fires under the
+# JOIN_SEMI probe and under nothing else.
+$node->safe_psql(
+	'postgres', q{
+CREATE TABLE d1(x int);
+CREATE TABLE d2(y int);
+INSERT INTO d1 SELECT generate_series(1, 500);
+INSERT INTO d2 SELECT generate_series(1, 500) % 100;
+ANALYZE d1, d2;
+});
+my $probe = run_and_capture_log(
+	q{SELECT count(*) FROM d1 WHERE EXISTS (SELECT 1 FROM d2 WHERE d2.y = d1.x)});
+if ($probe !~ $marker)
+{
+	plan skip_all => 'server does not carry the JOIN_SEMI probe';
+}
+
 # 1. EXISTS gives a semi-join: the plan must be logged, and it must be an
 #    ANALYZE plan, not a bare EXPLAIN.
 my $log = run_and_capture_log(

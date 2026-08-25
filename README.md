@@ -32,13 +32,26 @@ So the question you ask lives in two lines of a patch you throw away after the
 investigation, and the plumbing — instrumentation, nesting, formatting,
 GUCs — stays put.
 
-The demo patch in `patches/0001-planner-probe-JOIN_SEMI.patch`
-(`...-master.patch` for the master branch) asks: *was a
-`JOIN_SEMI` path built for this query?* It raises the flag in
-`create_nestloop_path()`, `create_mergejoin_path()` and
-`create_hashjoin_path()` when `jointype == JOIN_SEMI`.
+## The probes that ship with it
 
-To ask something else, move those three hunks. Nothing here changes.
+Two demo patches, and they export the same boolean — **apply one or the other,
+never both**:
+
+| patch | the question it asks | where it raises the flag |
+| --- | --- | --- |
+| `patches/0001-planner-probe-JOIN_SEMI.patch` | was a `JOIN_SEMI` path built? | `create_nestloop_path()`, `create_mergejoin_path()`, `create_hashjoin_path()` when `jointype == JOIN_SEMI` |
+| `patches/0002-planner-probe-parameterized-nestloop.patch` | was a **parameterized nestloop** built — the inner path drawing its parameters from the outer relation? | `create_nestloop_path()`, when `bms_overlap(inner_req_outer, outerrelids)` |
+
+`...-master.patch` is 0001 rebased onto master. Both raise the flag regardless
+of what the cost comparison decides afterwards, so a query gets logged even when
+the final plan shows no trace of the path — which is the entire point.
+
+A note on what 0002 does *not* test: a nestloop can also be parameterized from
+above, meaning the join as a whole needs parameters from an outer relation.
+That is `required_outer` being non-empty, and swapping the test is a one-line
+change if that is the question you want.
+
+To ask something else again, move the hunks. Nothing in the module changes.
 
 ## Build
 
@@ -103,16 +116,44 @@ logged for something you would never see in its plan.
 ## Testing
 
 ```sh
-make -C contrib/pg_probe_explain check          # TAP test
+make -C contrib/pg_probe_explain check          # both TAP tests
 contrib/pg_probe_explain/test/demo.sh $(pg_config --bindir)
 ```
 
-`test/demo.sh` starts a throwaway cluster, runs six queries, checks which of
-them ended up in the log and prints the log entries. The TAP test does the
-same plus the nesting and leak checks.
+There is one TAP test per probe — `t/001_probe_join_semi.pl` and
+`t/002_probe_param_nestloop.pl` — and each starts by asking the server which
+probe it carries, then skips itself if the answer is the other one. The
+detection queries are chosen so that only their own probe can fire: a semi join
+between two tables with no indexes cannot produce a parameterized path, and a
+plain inner join cannot produce a semi join. So `make check` is meaningful
+whichever patch is applied, and the skip in the output tells you which one it
+was.
+
+`test/demo.sh` is written against the `JOIN_SEMI` probe: it runs six queries,
+checks which ended up in the log, and prints the entries.
 
 `.github/workflows/pg_probe_explain.yml` runs both against a freshly built
 PostgreSQL 18 with the demo patch applied.
+
+## Deploying onto a test stand
+
+`deploy/tantor-1c-probe-deploy.sh` puts all of this onto the 1C load-test stand
+without touching the databases: it ships the branch plus the patch and the
+module, builds on the stand, swaps the binaries under the existing PGDATA and
+rewrites the logging configuration so that probe-triggered plans are the only
+thing the log receives — `auto_explain` included in what gets turned off.
+
+```sh
+./deploy/tantor-1c-probe-deploy.sh --dry-run     # show the plan
+./deploy/tantor-1c-probe-deploy.sh               # do it
+./deploy/tantor-1c-probe-deploy.sh --rollback    # binaries and config back
+```
+
+Two safety rails worth knowing: the build stage compares `CATALOG_VERSION_NO`
+of the new source with the cluster's, and aborts before anything is stopped if
+they differ; and the whole old prefix is tarred into
+`~/pgdev/rollback/probe-<timestamp>/` together with the config files and the
+`ALTER SYSTEM` settings that had to be reset.
 
 ## Limitations
 
