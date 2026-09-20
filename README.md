@@ -34,22 +34,38 @@ GUCs — stays put.
 
 ## The probes that ship with it
 
-Two demo patches, and they export the same boolean — **apply one or the other,
-never both**:
+Three demo patches, and they export the same boolean — **apply one of them,
+never several**:
 
 | patch | the question it asks | where it raises the flag |
 | --- | --- | --- |
 | `patches/0001-planner-probe-JOIN_SEMI.patch` | was a `JOIN_SEMI` path built? | `create_nestloop_path()`, `create_mergejoin_path()`, `create_hashjoin_path()` when `jointype == JOIN_SEMI` |
 | `patches/0002-planner-probe-parameterized-nestloop.patch` | was a **parameterized nestloop** built — the inner path drawing its parameters from the outer relation? | `create_nestloop_path()`, when `bms_overlap(inner_req_outer, outerrelids)` |
+| `patches/0003-planner-probe-self-outer-join.patch` | does the query contain a **self outer join performed on a self-join condition** — a table joined to itself by `X = X` under a `LEFT`/`RIGHT`/`FULL`/anti join? | `remove_self_joins_one_group()` in `analyzejoins.c`, on the pair it is about to drop |
 
-`...-master.patch` is 0001 rebased onto master. Both raise the flag regardless
-of what the cost comparison decides afterwards, so a query gets logged even when
-the final plan shows no trace of the path — which is the entire point.
+`...-master.patch` is 0001 rebased onto master. 0001 and 0002 raise the flag
+regardless of what the cost comparison decides afterwards, so a query gets
+logged even when the final plan shows no trace of the path — which is the
+entire point.
 
 A note on what 0002 does *not* test: a nestloop can also be parameterized from
 above, meaning the join as a whole needs parameters from an outer relation.
 That is `required_outer` being non-empty, and swapping the test is a one-line
 change if that is the question you want.
+
+0003 is a different shape of probe: instead of watching paths being built, it
+rides along with a planner decision that has already been made. Self-join
+elimination throws away a pair of same-table relations as soon as it sees they
+are not on the same side of every special join. The patch lets the pair live
+one step longer, looks at the condition of that join, raises the flag if it is
+a self-join condition, and then drops the pair exactly as before — planning is
+not affected, and `make check` on the server passes unmodified. Two things it
+does not report: **semi joins** (their quals become equivalence classes, and a
+unique-inner semijoin is reduced to an inner join before this code runs), and
+**anything at all while `enable_self_join_elimination` is off**, since that
+switch turns off the pass the probe lives in. No uniqueness proof is attempted
+— the question is whether such a join is there, not whether it could be
+eliminated.
 
 To ask something else again, move the hunks. Nothing in the module changes.
 
@@ -116,23 +132,24 @@ logged for something you would never see in its plan.
 ## Testing
 
 ```sh
-make -C contrib/pg_probe_explain check          # both TAP tests
+make -C contrib/pg_probe_explain check          # all three TAP tests
 contrib/pg_probe_explain/test/demo.sh $(pg_config --bindir)
 ```
 
-There is one TAP test per probe — `t/001_probe_join_semi.pl` and
-`t/002_probe_param_nestloop.pl` — and each starts by asking the server which
-probe it carries, then skips itself if the answer is the other one. The
-detection queries are chosen so that only their own probe can fire: a semi join
-between two tables with no indexes cannot produce a parameterized path, and a
-plain inner join cannot produce a semi join. So `make check` is meaningful
-whichever patch is applied, and the skip in the output tells you which one it
-was.
+There is one TAP test per probe — `t/001_probe_join_semi.pl`,
+`t/002_probe_param_nestloop.pl` and `t/003_probe_self_outer_join.pl` — and each
+starts by asking the server which probe it carries, then skips itself if the
+answer is one of the others. The detection queries are chosen so that only
+their own probe can fire: a semi join between two tables with no indexes
+cannot produce a parameterized path, a plain inner join cannot produce a semi
+join, and a table with no indexes left-joined to itself produces neither. So
+`make check` is meaningful whichever patch is applied, and the skips in the
+output tell you which one it was.
 
 `test/demo.sh` is written against the `JOIN_SEMI` probe: it runs six queries,
 checks which ended up in the log, and prints the entries.
 
-`.github/workflows/pg_probe_explain.yml` runs both against a freshly built
+`.github/workflows/pg_probe_explain.yml` runs them against a freshly built
 PostgreSQL 18 with the demo patch applied.
 
 ## Deploying onto a test stand

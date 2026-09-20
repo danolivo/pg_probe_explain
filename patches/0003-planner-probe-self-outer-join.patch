@@ -1,0 +1,286 @@
+From: Andrei Lepikhov <andrei.lepikhov@pgedge.com>
+Subject: [PATCH] Demo planner probe: raise a flag on a self outer join
+
+Debugging-only core patch for contrib/pg_probe_explain, an alternative to
+0001 and 0002 - all three export the same boolean, so apply one of them, not
+several.
+
+It teaches the self-join elimination code to report the case it deliberately
+refuses to handle: two scans of the same table sitting on opposite sides of an
+outer join, tied together by a self-join condition ("X = X").
+remove_self_joins_one_group() throws such a pair away as soon as it sees that
+the two relations are not on the same side of every special join.  Here the
+pair survives that check for a moment longer: if the two relations are exactly
+the two sides of that special join, probe_self_outer_join() looks at the
+condition of the join, raises planner_probe_hit when it finds a self-join
+qual, and only then the pair is dropped, exactly as before.  Nothing about
+planning changes; `make check` passes unmodified.
+
+Where the condition is found depends on the kind of join.  A mergejoinable
+"outervar = innervar" qual of a LEFT, RIGHT or FULL join is set aside by
+deconstruct_jointree() in root->left_join_clauses and friends, each entry
+carrying the SpecialJoinInfo it belongs to - the most precise source there is.
+Everything else, the quals of an anti join in particular, is in the joininfo
+lists of the two relations by then.  Both are fed to split_selfjoin_quals(),
+the routine the elimination code itself uses to tell "x = x" from "a = b".
+
+FULL joins need one more thing: deconstruct_jointree() makes each of their
+sides a subproblem of its own, so the two never turn up in one group in
+remove_self_joins_recurse() and the probe there never sees them.
+probe_full_self_joins() walks root->join_info_list instead and hands every
+same-table pair of a FULL join to the same routine.
+
+What is *not* reported: semi joins (their quals are ordinary join quals and
+get absorbed by an equivalence class, leaving the probe nothing to look at -
+and a unique-inner semi join is reduced to an inner join before this code runs
+anyway), and anything at all when enable_self_join_elimination is off, since
+that switch turns off the pass this probe lives in.
+
+No uniqueness proof is attempted.  The question asked is "does this query
+contain a self outer join performed on a self-join condition", not "could that
+join be eliminated" - which is the whole point, since the answer to the second
+one is currently always "no".
+
+Applies to REL_18_STABLE (tested at 051db7737c1, 18.6).
+---
+diff --git a/src/backend/optimizer/plan/analyzejoins.c b/src/backend/optimizer/plan/analyzejoins.c
+index df7796b..604a663 100644
+--- a/src/backend/optimizer/plan/analyzejoins.c
++++ b/src/backend/optimizer/plan/analyzejoins.c
+@@ -99,6 +99,9 @@ static void fixup_selfjoin_jointree(PlannerInfo *root, Node *jtnode, int relid,
+ static List *fixup_selfjoin_quals(PlannerInfo *root, List *quals, int relid);
+ static Node *replace_selfjoin_qual(Node *qual);
+ static int	self_join_candidates_cmp(const void *a, const void *b);
++static void probe_self_outer_join(PlannerInfo *root, RelOptInfo *rrel,
++								  RelOptInfo *krel, SpecialJoinInfo *sjinfo);
++static void probe_full_self_joins(PlannerInfo *root);
+ 
+ 
+ /*
+@@ -1847,6 +1850,7 @@ remove_self_joins_one_group(PlannerInfo *root, Relids relids)
+ 			List	   *otherjoinquals;
+ 			ListCell   *lc;
+ 			bool		jinfo_check = true;
++			SpecialJoinInfo *probe_sjinfo = NULL;
+ 			PlanRowMark *kmark = NULL;
+ 			PlanRowMark *rmark = NULL;
+ 			List	   *uclauses = NIL;
+@@ -1870,11 +1874,34 @@ remove_self_joins_one_group(PlannerInfo *root, Relids relids)
+ 					 bms_is_member(r, info->syn_righthand)))
+ 				{
+ 					jinfo_check = false;
++
++					/*
++					 * Probe: remember the special join if these two relations
++					 * are precisely its two sides.  Any other reason for the
++					 * check to fail - one of them sitting inside the other
++					 * side of some unrelated join, say - is of no interest
++					 * here.
++					 */
++					if ((bms_is_member(k, info->syn_lefthand) &&
++						 bms_is_member(r, info->syn_righthand)) ||
++						(bms_is_member(r, info->syn_lefthand) &&
++						 bms_is_member(k, info->syn_righthand)))
++						probe_sjinfo = info;
+ 					break;
+ 				}
+ 			}
+ 			if (!jinfo_check)
++			{
++				/*
++				 * The join stays, and that is still this routine's answer.
++				 * Before dropping the pair, though, let the probe have a look
++				 * at it: a self join under an outer join is exactly what it
++				 * is asked to report.
++				 */
++				if (probe_sjinfo != NULL)
++					probe_self_outer_join(root, rrel, krel, probe_sjinfo);
+ 				continue;
++			}
+ 
+ 			/*
+ 			 * Check Row Marks equivalence. We can't remove the join if the
+@@ -1988,6 +2015,135 @@ remove_self_joins_one_group(PlannerInfo *root, Relids relids)
+ 	return removed;
+ }
+ 
++/*
++ * probe_self_outer_join
++ *		Debugging probe: report a self join hidden under an outer join.
++ *
++ * 'rrel' and 'krel' scan the same table and are the two sides of the special
++ * join 'sjinfo'.  If the condition of that join is a self-join condition -
++ * a mergejoinable equality whose two sides are the same expression over the
++ * two relations, the "X = X" that remove_self_joins_one_group() looks for -
++ * raise planner_probe_hit, so that a loadable module can notice it once
++ * planning is over.  Nothing else changes: the caller still refuses to
++ * remove the join.
++ *
++ * Note that no uniqueness proof is attempted here.  The question the probe
++ * asks is "does this query contain a self outer join performed on a
++ * self-join condition", not "could that join be eliminated".
++ */
++static void
++probe_self_outer_join(PlannerInfo *root, RelOptInfo *rrel, RelOptInfo *krel,
++					  SpecialJoinInfo *sjinfo)
++{
++	Relids		joinrelids;
++	List	   *ojclauses[3];
++	List	   *joinquals = NIL;
++	List	   *selfjoinquals;
++	List	   *otherjoinquals;
++	int			i;
++
++	/* The flag is sticky - one report per query is enough */
++	if (planner_probe_hit)
++		return;
++
++	joinrelids = bms_union(rrel->relids, krel->relids);
++
++	/*
++	 * A mergejoinable "outervar = innervar" qual of a LEFT, RIGHT or FULL
++	 * join is set aside by deconstruct_jointree() in one of these lists,
++	 * together with the special join it came from, and is not in the joininfo
++	 * lists at this point.  That makes them the most precise source we have:
++	 * the clause is known to be the join condition of that very join.
++	 */
++	ojclauses[0] = root->left_join_clauses;
++	ojclauses[1] = root->right_join_clauses;
++	ojclauses[2] = root->full_join_clauses;
++
++	for (i = 0; i < 3; i++)
++	{
++		foreach_node(OuterJoinClauseInfo, ojcinfo, ojclauses[i])
++		{
++			if (ojcinfo->sjinfo != sjinfo)
++				continue;
++			if (!bms_equal(ojcinfo->rinfo->clause_relids, joinrelids))
++				continue;
++
++			joinquals = lappend(joinquals, ojcinfo->rinfo);
++		}
++	}
++
++	/*
++	 * Everything else - the quals of a semi or anti join, and outer join
++	 * quals of shapes the lists above don't cover - has been handed to the
++	 * joininfo lists of the relations they mention.  An outer join qual can't
++	 * be pushed down, so a clause mentioning exactly our two relations is
++	 * applied at this join.
++	 */
++	foreach_node(RestrictInfo, rinfo, rrel->joininfo)
++	{
++		if (!bms_equal(rinfo->clause_relids, joinrelids))
++			continue;
++		if (list_member_ptr(joinquals, rinfo))
++			continue;
++
++		joinquals = lappend(joinquals, rinfo);
++	}
++
++	if (joinquals == NIL)
++		return;
++
++	/* Is any of them an "X = X" over the two relations? */
++	split_selfjoin_quals(root, joinquals, &selfjoinquals, &otherjoinquals,
++						 rrel->relid, krel->relid);
++
++	if (selfjoinquals != NIL)
++		planner_probe_hit = true;
++}
++
++/*
++ * probe_full_self_joins
++ *		Debugging probe: the FULL join case of probe_self_outer_join().
++ *
++ * deconstruct_jointree() makes each side of a FULL join a subproblem of its
++ * own, so the two sides never turn up in one group in
++ * remove_self_joins_recurse() and the probe there never sees them.  Walk the
++ * special joins instead and hand every same-table pair to the probe.
++ */
++static void
++probe_full_self_joins(PlannerInfo *root)
++{
++	foreach_node(SpecialJoinInfo, sjinfo, root->join_info_list)
++	{
++		int			r = -1;
++
++		if (sjinfo->jointype != JOIN_FULL)
++			continue;
++
++		while ((r = bms_next_member(sjinfo->syn_lefthand, r)) > 0)
++		{
++			RelOptInfo *rrel = root->simple_rel_array[r];
++			RangeTblEntry *rrte = root->simple_rte_array[r];
++			int			k = -1;
++
++			if (rrel == NULL || rrte->rtekind != RTE_RELATION)
++				continue;
++
++			while ((k = bms_next_member(sjinfo->syn_righthand, k)) > 0)
++			{
++				RelOptInfo *krel = root->simple_rel_array[k];
++				RangeTblEntry *krte = root->simple_rte_array[k];
++
++				if (krel == NULL || krte->rtekind != RTE_RELATION)
++					continue;
++				if (krte->relid != rrte->relid)
++					continue;
++
++				probe_self_outer_join(root, rrel, krel, sjinfo);
++			}
++		}
++	}
++}
++
+ /*
+  * Gather indexes of base relations from the joinlist and try to eliminate
+  * self-joins.
+@@ -2171,6 +2327,9 @@ remove_useless_self_joins(PlannerInfo *root, List *joinlist)
+ 		(list_length(joinlist) == 1 && !IsA(linitial(joinlist), List)))
+ 		return false;
+ 
++	/* Probe: the pass below can't see the two sides of a FULL join */
++	probe_full_self_joins(root);
++
+ 	/* Try to merge pairs of self-joined relations. */
+ 	return remove_self_joins_recurse(root, joinlist);
+ }
+diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+index d76f693..4616975 100644
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -42,6 +42,13 @@ typedef enum
+ 	COSTS_DIFFERENT,			/* neither path dominates the other on cost */
+ } PathCostComparison;
+ 
++/*
++ * Probe flag reported to loadable modules.  Here it is raised whenever the
++ * planner detects a self join under an outer join; see the comment in
++ * pathnode.h and probe_self_outer_join() in analyzejoins.c.
++ */
++bool		planner_probe_hit = false;
++
+ /*
+  * STD_FUZZ_FACTOR is the normal fuzz factor for compare_path_costs_fuzzily.
+  * XXX is it worth making this user-controllable?  It provides a tradeoff
+diff --git a/src/include/optimizer/pathnode.h b/src/include/optimizer/pathnode.h
+index 60dcdb7..4814834 100644
+--- a/src/include/optimizer/pathnode.h
++++ b/src/include/optimizer/pathnode.h
+@@ -17,6 +17,15 @@
+ #include "nodes/bitmapset.h"
+ #include "nodes/pathnodes.h"
+ 
++/*
++ * Debugging aid: a probe flag that the planner sets when a condition of
++ * interest is met while planning, so that a loadable module can notice it
++ * once planning is over.  The core only ever sets the flag; clearing it
++ * before planning is the reader's responsibility.  See
++ * contrib/pg_probe_explain.
++ */
++extern PGDLLIMPORT bool planner_probe_hit;
++
+ 
+ /*
+  * prototypes for pathnode.c
